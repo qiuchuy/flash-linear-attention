@@ -1,17 +1,25 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import os
 import torch
 import triton
 import triton.language as tl
 
 from fla.modules.l2norm import l2norm_fwd
 from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra
+from fla.ops.kda.chunk_intra_token_parallel import chunk_kda_fwd_intra_token_parallel
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
+from fla.ops.kda.wy_fast import recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.ops.utils.op import exp2
-from fla.utils import autotune_cache_kwargs, input_guard
+from fla.utils import IS_TF32_SUPPORTED, autotune_cache_kwargs, input_guard
+
+if IS_TF32_SUPPORTED:
+    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
+else:
+    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
 @triton.heuristics({
@@ -296,6 +304,682 @@ def chunk_kda_fwd_fused_kernel_h_o(
             tl.store(p_ht4, b_h4.to(p_ht4.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit
+def _solve_tril_16_from_raw(
+    b_Araw,
+    T,
+    i_ti,
+    BC: tl.constexpr,
+):
+    o_i = tl.arange(0, BC)
+    m_A = o_i[:, None] > o_i[None, :]
+    m_I = o_i[:, None] == o_i[None, :]
+
+    b_Ai = -tl.where(m_A, b_Araw, 0.0)
+    for i in range(2, min(BC, T - i_ti)):
+        b_a = -tl.sum(tl.where((o_i == i)[:, None], b_Araw, 0.0), axis=0)
+        b_a = tl.where(o_i < i, b_a, 0.0)
+        b_a += tl.sum(b_a[:, None] * b_Ai, axis=0)
+        b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
+
+    return b_Ai + m_I
+
+
+@triton.heuristics({
+    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+})
+@triton.jit(do_not_specialize=["T"])
+def chunk_kda_fwd_kernel_intra_fused(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    w,
+    u,
+    kg,
+    Aqk,
+    Akk,
+    Akkd,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    scale: tl.constexpr,
+    LOAD_DIAG_FROM_AKKD: tl.constexpr,
+    FUSE_RECOMPUTE: tl.constexpr,
+    STORE_AKK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    i_tc0 = i_t * BT
+    i_tc1 = i_t * BT + BC
+    i_tc2 = i_t * BT + 2 * BC
+    i_tc3 = i_t * BT + 3 * BC
+    if i_tc0 >= T:
+        return
+
+    q += (bos * H + i_h) * K
+    k += (bos * H + i_h) * K
+    g += (bos * H + i_h) * K
+    v += (bos * H + i_h) * V
+    w += (bos * H + i_h) * K
+    u += (bos * H + i_h) * V
+    kg += (bos * H + i_h) * K
+    beta += bos * H + i_h
+    Aqk += (bos * H + i_h) * BT
+    Akk += (bos * H + i_h) * BT
+    Akkd += (bos * H + i_h) * BC
+
+    o_i = tl.arange(0, BC)
+    m0 = i_tc0 + o_i < T
+    m1 = i_tc1 + o_i < T
+    m2 = i_tc2 + o_i < T
+    m3 = i_tc3 + o_i < T
+    m_Aqk_diag = o_i[:, None] >= o_i[None, :]
+    m_Akk_diag = o_i[:, None] > o_i[None, :]
+
+    ################################################################################
+    # Aqk. This phase stores Aqk directly and keeps it out of the WY inverse path.
+    ################################################################################
+    b_Aqk00 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk10 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk11 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk20 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk21 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk22 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk30 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk31 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk32 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Aqk33 = tl.zeros([BC, BC], dtype=tl.float32)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+
+        p_q0 = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
+        p_k0 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
+        p_g0 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
+        b_q0 = tl.load(p_q0, boundary_check=(0, 1)).to(tl.float32)
+        b_k0 = tl.load(p_k0, boundary_check=(0, 1)).to(tl.float32)
+        b_g0 = tl.load(p_g0, boundary_check=(0, 1)).to(tl.float32)
+        if not LOAD_DIAG_FROM_AKKD:
+            b_gn0_diag = tl.load(g + (i_tc0 + min(BC // 2, T - i_tc0 - 1)) * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_Aqk00 += tl.dot(
+                b_q0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_g0 - b_gn0_diag[None, :]), 0.0),
+                tl.trans(b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_gn0_diag[None, :] - b_g0), 0.0)),
+            )
+
+        if i_tc1 < T:
+            p_q1 = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
+            p_k1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
+            p_g1 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
+            b_q1 = tl.load(p_q1, boundary_check=(0, 1)).to(tl.float32)
+            b_k1 = tl.load(p_k1, boundary_check=(0, 1)).to(tl.float32)
+            b_g1 = tl.load(p_g1, boundary_check=(0, 1)).to(tl.float32)
+            b_gn1 = tl.load(g + i_tc1 * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_qg1 = b_q1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_g1 - b_gn1[None, :]), 0.0)
+            b_Aqk10 += tl.dot(b_qg1, tl.trans(b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_gn1[None, :] - b_g0), 0.0)))
+            if not LOAD_DIAG_FROM_AKKD:
+                b_gn1_diag = tl.load(g + (i_tc1 + min(BC // 2, T - i_tc1 - 1)) * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                b_Aqk11 += tl.dot(
+                    b_q1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_g1 - b_gn1_diag[None, :]), 0.0),
+                    tl.trans(b_k1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_gn1_diag[None, :] - b_g1), 0.0)),
+                )
+
+            if i_tc2 < T:
+                p_q2 = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
+                p_k2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
+                p_g2 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
+                b_q2 = tl.load(p_q2, boundary_check=(0, 1)).to(tl.float32)
+                b_k2 = tl.load(p_k2, boundary_check=(0, 1)).to(tl.float32)
+                b_g2 = tl.load(p_g2, boundary_check=(0, 1)).to(tl.float32)
+                b_gn2 = tl.load(g + i_tc2 * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                b_qg2 = b_q2 * tl.where(m2[:, None] & m_k[None, :], exp2(b_g2 - b_gn2[None, :]), 0.0)
+                b_Aqk20 += tl.dot(b_qg2, tl.trans(b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_gn2[None, :] - b_g0), 0.0)))
+                b_Aqk21 += tl.dot(b_qg2, tl.trans(b_k1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_gn2[None, :] - b_g1), 0.0)))
+                if not LOAD_DIAG_FROM_AKKD:
+                    b_gn2_diag = tl.load(g + (i_tc2 + min(BC // 2, T - i_tc2 - 1)) * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                    b_Aqk22 += tl.dot(
+                        b_q2 * tl.where(m2[:, None] & m_k[None, :], exp2(b_g2 - b_gn2_diag[None, :]), 0.0),
+                        tl.trans(b_k2 * tl.where(m2[:, None] & m_k[None, :], exp2(b_gn2_diag[None, :] - b_g2), 0.0)),
+                    )
+
+                if i_tc3 < T:
+                    p_q3 = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
+                    p_k3 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
+                    p_g3 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
+                    b_q3 = tl.load(p_q3, boundary_check=(0, 1)).to(tl.float32)
+                    b_k3 = tl.load(p_k3, boundary_check=(0, 1)).to(tl.float32)
+                    b_g3 = tl.load(p_g3, boundary_check=(0, 1)).to(tl.float32)
+                    b_gn3 = tl.load(g + i_tc3 * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                    b_qg3 = b_q3 * tl.where(m3[:, None] & m_k[None, :], exp2(b_g3 - b_gn3[None, :]), 0.0)
+                    b_Aqk30 += tl.dot(b_qg3, tl.trans(b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_gn3[None, :] - b_g0), 0.0)))
+                    b_Aqk31 += tl.dot(b_qg3, tl.trans(b_k1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_gn3[None, :] - b_g1), 0.0)))
+                    b_Aqk32 += tl.dot(b_qg3, tl.trans(b_k2 * tl.where(m2[:, None] & m_k[None, :], exp2(b_gn3[None, :] - b_g2), 0.0)))
+                    if not LOAD_DIAG_FROM_AKKD:
+                        b_gn3_diag = tl.load(g + (i_tc3 + min(BC // 2, T - i_tc3 - 1)) * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                        b_Aqk33 += tl.dot(
+                            b_q3 * tl.where(m3[:, None] & m_k[None, :], exp2(b_g3 - b_gn3_diag[None, :]), 0.0),
+                            tl.trans(b_k3 * tl.where(m3[:, None] & m_k[None, :], exp2(b_gn3_diag[None, :] - b_g3), 0.0)),
+                        )
+
+    p_Aqk10 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc1, 0), (BC, BC), (1, 0))
+    p_Aqk20 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc2, 0), (BC, BC), (1, 0))
+    p_Aqk21 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc2, BC), (BC, BC), (1, 0))
+    p_Aqk30 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc3, 0), (BC, BC), (1, 0))
+    p_Aqk31 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc3, BC), (BC, BC), (1, 0))
+    p_Aqk32 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0))
+    if not LOAD_DIAG_FROM_AKKD:
+        p_Aqk00 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc0, 0), (BC, BC), (1, 0))
+        p_Aqk11 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc1, BC), (BC, BC), (1, 0))
+        p_Aqk22 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0))
+        p_Aqk33 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0))
+        tl.store(p_Aqk00, tl.where(m_Aqk_diag, b_Aqk00 * scale, 0.0).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Aqk11, tl.where(m_Aqk_diag, b_Aqk11 * scale, 0.0).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Aqk22, tl.where(m_Aqk_diag, b_Aqk22 * scale, 0.0).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Aqk33, tl.where(m_Aqk_diag, b_Aqk33 * scale, 0.0).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aqk10, (b_Aqk10 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aqk20, (b_Aqk20 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aqk21, (b_Aqk21 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aqk30, (b_Aqk30 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aqk31, (b_Aqk31 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_Aqk32, (b_Aqk32 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
+
+    ################################################################################
+    # Akk raw blocks.
+    ################################################################################
+    b_Akk00 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk10 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk11 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk20 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk21 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk22 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk30 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk31 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk32 = tl.zeros([BC, BC], dtype=tl.float32)
+    b_Akk33 = tl.zeros([BC, BC], dtype=tl.float32)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+
+        p_k0 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
+        p_g0 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
+        b_k0 = tl.load(p_k0, boundary_check=(0, 1)).to(tl.float32)
+        b_g0 = tl.load(p_g0, boundary_check=(0, 1)).to(tl.float32)
+        if not LOAD_DIAG_FROM_AKKD:
+            b_gn0_diag = tl.load(g + (i_tc0 + min(BC // 2, T - i_tc0 - 1)) * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_Akk00 += tl.dot(
+                b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_g0 - b_gn0_diag[None, :]), 0.0),
+                tl.trans(b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_gn0_diag[None, :] - b_g0), 0.0)),
+            )
+
+        if i_tc1 < T:
+            p_k1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
+            p_g1 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
+            b_k1 = tl.load(p_k1, boundary_check=(0, 1)).to(tl.float32)
+            b_g1 = tl.load(p_g1, boundary_check=(0, 1)).to(tl.float32)
+            b_gn1 = tl.load(g + i_tc1 * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            b_kg1 = b_k1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_g1 - b_gn1[None, :]), 0.0)
+            b_Akk10 += tl.dot(b_kg1, tl.trans(b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_gn1[None, :] - b_g0), 0.0)))
+            if not LOAD_DIAG_FROM_AKKD:
+                b_gn1_diag = tl.load(g + (i_tc1 + min(BC // 2, T - i_tc1 - 1)) * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                b_Akk11 += tl.dot(
+                    b_k1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_g1 - b_gn1_diag[None, :]), 0.0),
+                    tl.trans(b_k1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_gn1_diag[None, :] - b_g1), 0.0)),
+                )
+
+            if i_tc2 < T:
+                p_k2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
+                p_g2 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
+                b_k2 = tl.load(p_k2, boundary_check=(0, 1)).to(tl.float32)
+                b_g2 = tl.load(p_g2, boundary_check=(0, 1)).to(tl.float32)
+                b_gn2 = tl.load(g + i_tc2 * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                b_kg2 = b_k2 * tl.where(m2[:, None] & m_k[None, :], exp2(b_g2 - b_gn2[None, :]), 0.0)
+                b_Akk20 += tl.dot(b_kg2, tl.trans(b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_gn2[None, :] - b_g0), 0.0)))
+                b_Akk21 += tl.dot(b_kg2, tl.trans(b_k1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_gn2[None, :] - b_g1), 0.0)))
+                if not LOAD_DIAG_FROM_AKKD:
+                    b_gn2_diag = tl.load(g + (i_tc2 + min(BC // 2, T - i_tc2 - 1)) * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                    b_Akk22 += tl.dot(
+                        b_k2 * tl.where(m2[:, None] & m_k[None, :], exp2(b_g2 - b_gn2_diag[None, :]), 0.0),
+                        tl.trans(b_k2 * tl.where(m2[:, None] & m_k[None, :], exp2(b_gn2_diag[None, :] - b_g2), 0.0)),
+                    )
+
+                if i_tc3 < T:
+                    p_k3 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
+                    p_g3 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
+                    b_k3 = tl.load(p_k3, boundary_check=(0, 1)).to(tl.float32)
+                    b_g3 = tl.load(p_g3, boundary_check=(0, 1)).to(tl.float32)
+                    b_gn3 = tl.load(g + i_tc3 * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                    b_kg3 = b_k3 * tl.where(m3[:, None] & m_k[None, :], exp2(b_g3 - b_gn3[None, :]), 0.0)
+                    b_Akk30 += tl.dot(b_kg3, tl.trans(b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_gn3[None, :] - b_g0), 0.0)))
+                    b_Akk31 += tl.dot(b_kg3, tl.trans(b_k1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_gn3[None, :] - b_g1), 0.0)))
+                    b_Akk32 += tl.dot(b_kg3, tl.trans(b_k2 * tl.where(m2[:, None] & m_k[None, :], exp2(b_gn3[None, :] - b_g2), 0.0)))
+                    if not LOAD_DIAG_FROM_AKKD:
+                        b_gn3_diag = tl.load(g + (i_tc3 + min(BC // 2, T - i_tc3 - 1)) * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                        b_Akk33 += tl.dot(
+                            b_k3 * tl.where(m3[:, None] & m_k[None, :], exp2(b_g3 - b_gn3_diag[None, :]), 0.0),
+                            tl.trans(b_k3 * tl.where(m3[:, None] & m_k[None, :], exp2(b_gn3_diag[None, :] - b_g3), 0.0)),
+                        )
+
+    p_b0 = tl.make_block_ptr(beta, (T,), (H,), (i_tc0,), (BC,), (0,))
+    p_b1 = tl.make_block_ptr(beta, (T,), (H,), (i_tc1,), (BC,), (0,))
+    p_b2 = tl.make_block_ptr(beta, (T,), (H,), (i_tc2,), (BC,), (0,))
+    p_b3 = tl.make_block_ptr(beta, (T,), (H,), (i_tc3,), (BC,), (0,))
+    b_b0 = tl.load(p_b0, boundary_check=(0,)).to(tl.float32)
+    b_b1 = tl.load(p_b1, boundary_check=(0,)).to(tl.float32)
+    b_b2 = tl.load(p_b2, boundary_check=(0,)).to(tl.float32)
+    b_b3 = tl.load(p_b3, boundary_check=(0,)).to(tl.float32)
+
+    if not LOAD_DIAG_FROM_AKKD:
+        b_Akk00 = tl.where(m_Akk_diag, b_Akk00 * b_b0[:, None], 0.0)
+        b_Akk11 = tl.where(m_Akk_diag, b_Akk11 * b_b1[:, None], 0.0)
+        b_Akk22 = tl.where(m_Akk_diag, b_Akk22 * b_b2[:, None], 0.0)
+        b_Akk33 = tl.where(m_Akk_diag, b_Akk33 * b_b3[:, None], 0.0)
+    b_Akk10 = b_Akk10 * b_b1[:, None]
+    b_Akk20 = b_Akk20 * b_b2[:, None]
+    b_Akk21 = b_Akk21 * b_b2[:, None]
+    b_Akk30 = b_Akk30 * b_b3[:, None]
+    b_Akk31 = b_Akk31 * b_b3[:, None]
+    b_Akk32 = b_Akk32 * b_b3[:, None]
+
+    if LOAD_DIAG_FROM_AKKD:
+        p_Akkd00 = tl.make_block_ptr(Akkd, (T, BC), (H * BC, 1), (i_tc0, 0), (BC, BC), (1, 0))
+        p_Akkd11 = tl.make_block_ptr(Akkd, (T, BC), (H * BC, 1), (i_tc1, 0), (BC, BC), (1, 0))
+        p_Akkd22 = tl.make_block_ptr(Akkd, (T, BC), (H * BC, 1), (i_tc2, 0), (BC, BC), (1, 0))
+        p_Akkd33 = tl.make_block_ptr(Akkd, (T, BC), (H * BC, 1), (i_tc3, 0), (BC, BC), (1, 0))
+        b_Ai00 = _solve_tril_16_from_raw(tl.load(p_Akkd00, boundary_check=(0, 1)).to(tl.float32), T, i_tc0, BC)
+        b_Ai11 = _solve_tril_16_from_raw(tl.load(p_Akkd11, boundary_check=(0, 1)).to(tl.float32), T, i_tc1, BC)
+        b_Ai22 = _solve_tril_16_from_raw(tl.load(p_Akkd22, boundary_check=(0, 1)).to(tl.float32), T, i_tc2, BC)
+        b_Ai33 = _solve_tril_16_from_raw(tl.load(p_Akkd33, boundary_check=(0, 1)).to(tl.float32), T, i_tc3, BC)
+    else:
+        b_Ai00 = _solve_tril_16_from_raw(b_Akk00, T, i_tc0, BC)
+        b_Ai11 = _solve_tril_16_from_raw(b_Akk11, T, i_tc1, BC)
+        b_Ai22 = _solve_tril_16_from_raw(b_Akk22, T, i_tc2, BC)
+        b_Ai33 = _solve_tril_16_from_raw(b_Akk33, T, i_tc3, BC)
+
+    b_Ai10 = -tl.dot(
+        tl.dot(b_Ai11, b_Akk10, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        b_Ai00,
+        input_precision=SOLVE_TRIL_DOT_PRECISION,
+    )
+    b_Ai21 = -tl.dot(
+        tl.dot(b_Ai22, b_Akk21, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        b_Ai11,
+        input_precision=SOLVE_TRIL_DOT_PRECISION,
+    )
+    b_Ai32 = -tl.dot(
+        tl.dot(b_Ai33, b_Akk32, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        b_Ai22,
+        input_precision=SOLVE_TRIL_DOT_PRECISION,
+    )
+    b_Ai20 = -tl.dot(
+        b_Ai22,
+        tl.dot(b_Akk20, b_Ai00, input_precision=SOLVE_TRIL_DOT_PRECISION) +
+        tl.dot(b_Akk21, b_Ai10, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        input_precision=SOLVE_TRIL_DOT_PRECISION,
+    )
+    b_Ai31 = -tl.dot(
+        b_Ai33,
+        tl.dot(b_Akk31, b_Ai11, input_precision=SOLVE_TRIL_DOT_PRECISION) +
+        tl.dot(b_Akk32, b_Ai21, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        input_precision=SOLVE_TRIL_DOT_PRECISION,
+    )
+    b_Ai30 = -tl.dot(
+        b_Ai33,
+        tl.dot(b_Akk30, b_Ai00, input_precision=SOLVE_TRIL_DOT_PRECISION) +
+        tl.dot(b_Akk31, b_Ai10, input_precision=SOLVE_TRIL_DOT_PRECISION) +
+        tl.dot(b_Akk32, b_Ai20, input_precision=SOLVE_TRIL_DOT_PRECISION),
+        input_precision=SOLVE_TRIL_DOT_PRECISION,
+    )
+
+    if STORE_AKK:
+        p_Akk00 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc0, 0), (BC, BC), (1, 0))
+        p_Akk10 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc1, 0), (BC, BC), (1, 0))
+        p_Akk11 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc1, BC), (BC, BC), (1, 0))
+        p_Akk20 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc2, 0), (BC, BC), (1, 0))
+        p_Akk21 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc2, BC), (BC, BC), (1, 0))
+        p_Akk22 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0))
+        p_Akk30 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc3, 0), (BC, BC), (1, 0))
+        p_Akk31 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc3, BC), (BC, BC), (1, 0))
+        p_Akk32 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0))
+        p_Akk33 = tl.make_block_ptr(Akk, (T, BT), (H * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0))
+
+        tl.store(p_Akk00, b_Ai00.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk10, b_Ai10.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk11, b_Ai11.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk20, b_Ai20.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk21, b_Ai21.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk22, b_Ai22.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk30, b_Ai30.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk31, b_Ai31.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk32, b_Ai32.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Akk33, b_Ai33.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+
+    ################################################################################
+    # Recompute u from in-register inverse.
+    ################################################################################
+    if FUSE_RECOMPUTE:
+        for i_v in range(tl.cdiv(V, BV)):
+            p_v0 = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_tc0, i_v * BV), (BC, BV), (1, 0))
+            p_v1 = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_tc1, i_v * BV), (BC, BV), (1, 0))
+            p_v2 = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_tc2, i_v * BV), (BC, BV), (1, 0))
+            p_v3 = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_tc3, i_v * BV), (BC, BV), (1, 0))
+            b_v0 = tl.load(p_v0, boundary_check=(0, 1))
+            b_v1 = tl.load(p_v1, boundary_check=(0, 1))
+            b_v2 = tl.load(p_v2, boundary_check=(0, 1))
+            b_v3 = tl.load(p_v3, boundary_check=(0, 1))
+            b_vb0 = (b_v0 * b_b0[:, None]).to(b_v0.dtype)
+            b_vb1 = (b_v1 * b_b1[:, None]).to(b_v1.dtype)
+            b_vb2 = (b_v2 * b_b2[:, None]).to(b_v2.dtype)
+            b_vb3 = (b_v3 * b_b3[:, None]).to(b_v3.dtype)
+
+            b_A00 = b_Ai00.to(b_v0.dtype)
+            b_A10 = b_Ai10.to(b_v0.dtype)
+            b_A11 = b_Ai11.to(b_v0.dtype)
+            b_A20 = b_Ai20.to(b_v0.dtype)
+            b_A21 = b_Ai21.to(b_v0.dtype)
+            b_A22 = b_Ai22.to(b_v0.dtype)
+            b_A30 = b_Ai30.to(b_v0.dtype)
+            b_A31 = b_Ai31.to(b_v0.dtype)
+            b_A32 = b_Ai32.to(b_v0.dtype)
+            b_A33 = b_Ai33.to(b_v0.dtype)
+
+            b_u0 = tl.dot(b_A00, b_vb0)
+            b_u1 = tl.dot(b_A10, b_vb0) + tl.dot(b_A11, b_vb1)
+            b_u2 = tl.dot(b_A20, b_vb0) + tl.dot(b_A21, b_vb1) + tl.dot(b_A22, b_vb2)
+            b_u3 = tl.dot(b_A30, b_vb0) + tl.dot(b_A31, b_vb1) + tl.dot(b_A32, b_vb2) + tl.dot(b_A33, b_vb3)
+
+            p_u0 = tl.make_block_ptr(u, (T, V), (H * V, 1), (i_tc0, i_v * BV), (BC, BV), (1, 0))
+            p_u1 = tl.make_block_ptr(u, (T, V), (H * V, 1), (i_tc1, i_v * BV), (BC, BV), (1, 0))
+            p_u2 = tl.make_block_ptr(u, (T, V), (H * V, 1), (i_tc2, i_v * BV), (BC, BV), (1, 0))
+            p_u3 = tl.make_block_ptr(u, (T, V), (H * V, 1), (i_tc3, i_v * BV), (BC, BV), (1, 0))
+            tl.store(p_u0, b_u0.to(p_u0.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_u1, b_u1.to(p_u1.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_u2, b_u2.to(p_u2.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_u3, b_u3.to(p_u3.dtype.element_ty), boundary_check=(0, 1))
+
+    ################################################################################
+    # Recompute w and kg from in-register inverse.
+    ################################################################################
+        last_idx = min(i_t * BT + BT, T) - 1
+        for i_k in range(tl.cdiv(K, BK)):
+            o_k = i_k * BK + tl.arange(0, BK)
+            m_k = o_k < K
+            p_k0 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
+            p_k1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
+            p_k2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
+            p_k3 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
+            p_g0 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
+            p_g1 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
+            p_g2 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
+            p_g3 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
+            b_k0 = tl.load(p_k0, boundary_check=(0, 1))
+            b_k1 = tl.load(p_k1, boundary_check=(0, 1))
+            b_k2 = tl.load(p_k2, boundary_check=(0, 1))
+            b_k3 = tl.load(p_k3, boundary_check=(0, 1))
+            b_g0 = tl.load(p_g0, boundary_check=(0, 1)).to(tl.float32)
+            b_g1 = tl.load(p_g1, boundary_check=(0, 1)).to(tl.float32)
+            b_g2 = tl.load(p_g2, boundary_check=(0, 1)).to(tl.float32)
+            b_g3 = tl.load(p_g3, boundary_check=(0, 1)).to(tl.float32)
+
+            b_kb0 = (b_k0 * b_b0[:, None] * exp2(b_g0)).to(b_k0.dtype)
+            b_kb1 = (b_k1 * b_b1[:, None] * exp2(b_g1)).to(b_k1.dtype)
+            b_kb2 = (b_k2 * b_b2[:, None] * exp2(b_g2)).to(b_k2.dtype)
+            b_kb3 = (b_k3 * b_b3[:, None] * exp2(b_g3)).to(b_k3.dtype)
+
+            b_A00 = b_Ai00.to(b_k0.dtype)
+            b_A10 = b_Ai10.to(b_k0.dtype)
+            b_A11 = b_Ai11.to(b_k0.dtype)
+            b_A20 = b_Ai20.to(b_k0.dtype)
+            b_A21 = b_Ai21.to(b_k0.dtype)
+            b_A22 = b_Ai22.to(b_k0.dtype)
+            b_A30 = b_Ai30.to(b_k0.dtype)
+            b_A31 = b_Ai31.to(b_k0.dtype)
+            b_A32 = b_Ai32.to(b_k0.dtype)
+            b_A33 = b_Ai33.to(b_k0.dtype)
+
+            b_w0 = tl.dot(b_A00, b_kb0)
+            b_w1 = tl.dot(b_A10, b_kb0) + tl.dot(b_A11, b_kb1)
+            b_w2 = tl.dot(b_A20, b_kb0) + tl.dot(b_A21, b_kb1) + tl.dot(b_A22, b_kb2)
+            b_w3 = tl.dot(b_A30, b_kb0) + tl.dot(b_A31, b_kb1) + tl.dot(b_A32, b_kb2) + tl.dot(b_A33, b_kb3)
+
+            p_w0 = tl.make_block_ptr(w, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
+            p_w1 = tl.make_block_ptr(w, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
+            p_w2 = tl.make_block_ptr(w, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
+            p_w3 = tl.make_block_ptr(w, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
+            tl.store(p_w0, b_w0.to(p_w0.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_w1, b_w1.to(p_w1.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_w2, b_w2.to(p_w2.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_w3, b_w3.to(p_w3.dtype.element_ty), boundary_check=(0, 1))
+
+            b_gn = tl.load(g + last_idx * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+            p_kg0 = tl.make_block_ptr(kg, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
+            p_kg1 = tl.make_block_ptr(kg, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
+            p_kg2 = tl.make_block_ptr(kg, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
+            p_kg3 = tl.make_block_ptr(kg, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
+            b_kg0 = b_k0 * tl.where(m0[:, None] & m_k[None, :], exp2(b_gn[None, :] - b_g0), 0.0)
+            b_kg1 = b_k1 * tl.where(m1[:, None] & m_k[None, :], exp2(b_gn[None, :] - b_g1), 0.0)
+            b_kg2 = b_k2 * tl.where(m2[:, None] & m_k[None, :], exp2(b_gn[None, :] - b_g2), 0.0)
+            b_kg3 = b_k3 * tl.where(m3[:, None] & m_k[None, :], exp2(b_gn[None, :] - b_g3), 0.0)
+            tl.store(p_kg0, b_kg0.to(p_kg0.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_kg1, b_kg1.to(p_kg1.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_kg2, b_kg2.to(p_kg2.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_kg3, b_kg3.to(p_kg3.dtype.element_ty), boundary_check=(0, 1))
+
+
+def _chunk_kda_fwd_intra_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gk: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor, torch.Tensor, None]:
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    BT = chunk_size
+    BC = 16
+    BK = 64
+    BV = 64
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    kg = torch.empty_like(k)
+    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+
+    grid = (NT, B * H)
+    chunk_kda_fwd_kernel_intra_fused[grid](
+        q=q,
+        k=k,
+        v=v,
+        g=gk,
+        beta=beta,
+        w=w,
+        u=u,
+        kg=kg,
+        Aqk=Aqk,
+        Akk=Aqk,
+        Akkd=Aqk,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        BT=BT,
+        BC=BC,
+        BK=BK,
+        BV=BV,
+        scale=scale,
+        LOAD_DIAG_FROM_AKKD=False,
+        FUSE_RECOMPUTE=True,
+        STORE_AKK=False,
+        num_warps=4,
+        num_stages=2,
+    )
+    return w, u, None, kg, Aqk, None
+
+
+def _chunk_kda_fwd_intra_diag_inter_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gk: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, T, H, K = k.shape
+    BT = chunk_size
+    BC = 16
+    BK = 64
+    BV = 64
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+    Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
+
+    grid = (NT, B * H)
+    chunk_kda_fwd_kernel_intra_fused[grid](
+        q=q,
+        k=k,
+        v=v,
+        g=gk,
+        beta=beta,
+        w=k,
+        u=v,
+        kg=k,
+        Aqk=Aqk,
+        Akk=Akk,
+        Akkd=Aqk,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        K=K,
+        V=v.shape[-1],
+        BT=BT,
+        BC=BC,
+        BK=BK,
+        BV=BV,
+        scale=scale,
+        LOAD_DIAG_FROM_AKKD=False,
+        FUSE_RECOMPUTE=False,
+        STORE_AKK=True,
+        num_warps=4,
+        num_stages=2,
+    )
+    w, u, qg, kg = recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=Akk,
+        q=None,
+        gk=gk,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    return w, u, qg, kg, Aqk, Akk
+
+
+def _chunk_kda_fwd_intra_inter_recompute_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gk: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor, torch.Tensor, None]:
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    BT = chunk_size
+    BC = 16
+    BK = 64
+    BV = 64
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+    Akkd = torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
+    chunk_kda_fwd_intra_token_parallel(
+        q=q,
+        k=k,
+        gk=gk,
+        beta=beta,
+        Aqk=Aqk,
+        Akk=Akkd,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=BT,
+        sub_chunk_size=BC,
+    )
+
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    kg = torch.empty_like(k)
+
+    grid = (NT, B * H)
+    chunk_kda_fwd_kernel_intra_fused[grid](
+        q=q,
+        k=k,
+        v=v,
+        g=gk,
+        beta=beta,
+        w=w,
+        u=u,
+        kg=kg,
+        Aqk=Aqk,
+        Akk=Aqk,
+        Akkd=Akkd,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        BT=BT,
+        BC=BC,
+        BK=BK,
+        BV=BV,
+        scale=scale,
+        LOAD_DIAG_FROM_AKKD=True,
+        FUSE_RECOMPUTE=True,
+        STORE_AKK=False,
+        num_warps=4,
+        num_stages=2,
+    )
+    return w, u, None, kg, Aqk, None
+
+
 def _chunk_kda_fwd_h_o_fused(
     q: torch.Tensor,
     w: torch.Tensor,
@@ -344,708 +1028,6 @@ def _chunk_kda_fwd_h_o_fused(
     return o, final_state
 
 
-@triton.jit
-def _kda_fused_pair16(
-    q,
-    k,
-    g,
-    beta,
-    T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    chunk_start,
-    ROW: tl.constexpr,
-    COL: tl.constexpr,
-    scale: tl.constexpr,
-):
-    offs_m = tl.arange(0, 16)
-    offs_k = tl.arange(0, 64)
-    row_start = chunk_start + ROW * 16
-    col_start = chunk_start + COL * 16
-    ref_t = chunk_start + min(ROW * 16 + 8, T - chunk_start - 1)
-    m_row = row_start + offs_m < T
-    m_col = col_start + offs_m < T
-
-    b_beta = tl.load(beta + (row_start + offs_m) * H, mask=m_row, other=0.0).to(tl.float32)
-
-    p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (row_start, 0), (16, 64), (1, 0))
-    p_kr = tl.make_block_ptr(k, (T, K), (H * K, 1), (row_start, 0), (16, 64), (1, 0))
-    p_gr = tl.make_block_ptr(g, (T, K), (H * K, 1), (row_start, 0), (16, 64), (1, 0))
-    p_kc = tl.make_block_ptr(k, (T, K), (H * K, 1), (col_start, 0), (16, 64), (1, 0))
-    p_gc = tl.make_block_ptr(g, (T, K), (H * K, 1), (col_start, 0), (16, 64), (1, 0))
-
-    b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-    b_kr = tl.load(p_kr, boundary_check=(0, 1)).to(tl.float32)
-    b_gr = tl.load(p_gr, boundary_check=(0, 1)).to(tl.float32)
-    b_kc = tl.load(p_kc, boundary_check=(0, 1)).to(tl.float32)
-    b_gc = tl.load(p_gc, boundary_check=(0, 1)).to(tl.float32)
-    b_g_ref = tl.load(g + ref_t * H * K + offs_k, mask=offs_k < K, other=0.0).to(tl.float32)[None, :]
-
-    m_rk = m_row[:, None] & (offs_k[None, :] < K)
-    m_ck = m_col[:, None] & (offs_k[None, :] < K)
-    b_gm_r = b_gr - b_g_ref
-    b_qg = tl.where(m_rk, b_q * exp2(b_gm_r), 0.0)
-    b_kg = tl.where(m_rk, b_kr * exp2(b_gm_r), 0.0)
-    b_kng_t = tl.trans(tl.where(m_ck, b_kc * exp2(b_g_ref - b_gc), 0.0))
-    b_qk = tl.dot(b_qg, b_kng_t)
-    b_kk = tl.dot(b_kg, b_kng_t)
-
-    if K > 64:
-        o_k = 64 + offs_k
-        p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (row_start, 64), (16, 64), (1, 0))
-        p_kr = tl.make_block_ptr(k, (T, K), (H * K, 1), (row_start, 64), (16, 64), (1, 0))
-        p_gr = tl.make_block_ptr(g, (T, K), (H * K, 1), (row_start, 64), (16, 64), (1, 0))
-        p_kc = tl.make_block_ptr(k, (T, K), (H * K, 1), (col_start, 64), (16, 64), (1, 0))
-        p_gc = tl.make_block_ptr(g, (T, K), (H * K, 1), (col_start, 64), (16, 64), (1, 0))
-
-        b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-        b_kr = tl.load(p_kr, boundary_check=(0, 1)).to(tl.float32)
-        b_gr = tl.load(p_gr, boundary_check=(0, 1)).to(tl.float32)
-        b_kc = tl.load(p_kc, boundary_check=(0, 1)).to(tl.float32)
-        b_gc = tl.load(p_gc, boundary_check=(0, 1)).to(tl.float32)
-        b_g_ref = tl.load(g + ref_t * H * K + o_k, mask=o_k < K, other=0.0).to(tl.float32)[None, :]
-
-        m_rk = m_row[:, None] & (o_k[None, :] < K)
-        m_ck = m_col[:, None] & (o_k[None, :] < K)
-        b_gm_r = b_gr - b_g_ref
-        b_qg = tl.where(m_rk, b_q * exp2(b_gm_r), 0.0)
-        b_kg = tl.where(m_rk, b_kr * exp2(b_gm_r), 0.0)
-        b_kng_t = tl.trans(tl.where(m_ck, b_kc * exp2(b_g_ref - b_gc), 0.0))
-        b_qk += tl.dot(b_qg, b_kng_t)
-        b_kk += tl.dot(b_kg, b_kng_t)
-
-    valid = m_row[:, None] & m_col[None, :]
-    if ROW == COL:
-        lower = offs_m[:, None] >= offs_m[None, :]
-        strict = offs_m[:, None] > offs_m[None, :]
-        b_qk = tl.where(valid & lower, b_qk * scale, 0.0)
-        b_kk = tl.where(valid & strict, b_kk * b_beta[:, None], 0.0)
-    else:
-        b_qk = tl.where(valid, b_qk * scale, 0.0)
-        b_kk = tl.where(valid, b_kk * b_beta[:, None], 0.0)
-    return b_qk, b_kk
-
-
-@triton.jit
-def _kda_inv16(a):
-    offs = tl.arange(0, 16)
-    eye = offs[:, None] == offs[None, :]
-    x = -a
-    for i in range(2, 16):
-        row = tl.sum(tl.where(offs[:, None] == i, -a, 0.0), axis=0)
-        row = tl.where(offs < i, row, 0.0)
-        row += tl.sum(row[:, None] * x, axis=0)
-        x = tl.where((offs == i)[:, None], row, x)
-    return x + eye
-
-
-@triton.jit
-def _kda_load_qexp_kbg16(
-    q,
-    k,
-    g,
-    beta,
-    T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    chunk_start,
-    ROW: tl.constexpr,
-    K_OFF: tl.constexpr,
-):
-    offs_m = tl.arange(0, 16)
-    offs_k = tl.arange(0, 64)
-    row_start = chunk_start + ROW * 16
-    o_k = K_OFF + offs_k
-    m_row = row_start + offs_m < T
-    m_rk = m_row[:, None] & (o_k[None, :] < K)
-
-    p_q = tl.make_block_ptr(q, (T, K), (H * K, 1), (row_start, K_OFF), (16, 64), (1, 0))
-    p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (row_start, K_OFF), (16, 64), (1, 0))
-    p_g = tl.make_block_ptr(g, (T, K), (H * K, 1), (row_start, K_OFF), (16, 64), (1, 0))
-    b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-    b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
-    b_beta = tl.load(beta + (row_start + offs_m) * H, mask=m_row, other=0.0).to(tl.float32)
-    b_exp = exp2(b_g)
-    return tl.where(m_rk, b_q * b_exp, 0.0), tl.where(m_rk, b_k * b_beta[:, None] * b_exp, 0.0)
-
-
-@triton.jit
-def _kda_load_kg16(
-    k,
-    g,
-    T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    chunk_start,
-    last_idx,
-    ROW: tl.constexpr,
-    K_OFF: tl.constexpr,
-):
-    offs_m = tl.arange(0, 16)
-    offs_k = tl.arange(0, 64)
-    row_start = chunk_start + ROW * 16
-    o_k = K_OFF + offs_k
-    m_row = row_start + offs_m < T
-    m_rk = m_row[:, None] & (o_k[None, :] < K)
-    p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (row_start, K_OFF), (16, 64), (1, 0))
-    p_g = tl.make_block_ptr(g, (T, K), (H * K, 1), (row_start, K_OFF), (16, 64), (1, 0))
-    b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
-    b_g_last = tl.load(g + last_idx * H * K + o_k, mask=o_k < K, other=0.0).to(tl.float32)
-    return tl.where(m_rk, b_k * exp2(b_g_last[None, :] - b_g), 0.0), b_g_last
-
-
-@triton.heuristics({
-    "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-    "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-})
-@triton.jit(do_not_specialize=["T"])
-def chunk_kda_fwd_fully_fused_block_kernel(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    o,
-    h0,
-    ht,
-    cu_seqlens,
-    T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-    scale: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
-    TRANSPOSE_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
-    i_n, i_h = i_nh // H, i_nh % H
-
-    if IS_VARLEN:
-        bos = tl.load(cu_seqlens + i_n).to(tl.int64)
-        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        T = (eos - bos).to(tl.int32)
-    else:
-        bos = (i_n * T).to(tl.int64)
-        T = T.to(tl.int32)
-
-    NT = tl.cdiv(T, BT)
-
-    if TRANSPOSE_STATE:
-        b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
-        b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
-    else:
-        b_h1 = tl.zeros([64, BV], dtype=tl.float32)
-        b_h2 = tl.zeros([64, BV], dtype=tl.float32)
-
-    if USE_INITIAL_STATE:
-        h0 += i_nh * K * V
-        if TRANSPOSE_STATE:
-            p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-            p_h0_2 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0))
-        else:
-            p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-            p_h0_2 = tl.make_block_ptr(h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
-        b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
-
-    q += (bos * H + i_h) * K
-    k += (bos * H + i_h) * K
-    v += (bos * H + i_h) * V
-    g += (bos * H + i_h) * K
-    beta += bos * H + i_h
-    o += (bos * H + i_h) * V
-
-    offs_m = tl.arange(0, 16)
-
-    for i_t in range(NT):
-        chunk_start = i_t * BT
-
-        q00, a00 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 0, 0, scale)
-        q10, a10 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 1, 0, scale)
-        q11, a11 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 1, 1, scale)
-        q20, a20 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 2, 0, scale)
-        q21, a21 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 2, 1, scale)
-        q22, a22 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 2, 2, scale)
-        q30, a30 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 3, 0, scale)
-        q31, a31 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 3, 1, scale)
-        q32, a32 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 3, 2, scale)
-        q33, a33 = _kda_fused_pair16(q, k, g, beta, T, H, K, chunk_start, 3, 3, scale)
-
-        x00 = _kda_inv16(a00)
-        x11 = _kda_inv16(a11)
-        x22 = _kda_inv16(a22)
-        x33 = _kda_inv16(a33)
-
-        x10 = -tl.dot(tl.dot(x11, a10), x00)
-        x21 = -tl.dot(tl.dot(x22, a21), x11)
-        x32 = -tl.dot(tl.dot(x33, a32), x22)
-        x20 = -tl.dot(x22, tl.dot(a20, x00) + tl.dot(a21, x10))
-        x31 = -tl.dot(x33, tl.dot(a31, x11) + tl.dot(a32, x21))
-        x30 = -tl.dot(x33, tl.dot(a30, x00) + tl.dot(a31, x10) + tl.dot(a32, x20))
-
-        p_v0 = tl.make_block_ptr(v, (T, V), (H * V, 1), (chunk_start, i_v * BV), (16, BV), (1, 0))
-        p_v1 = tl.make_block_ptr(v, (T, V), (H * V, 1), (chunk_start + 16, i_v * BV), (16, BV), (1, 0))
-        p_v2 = tl.make_block_ptr(v, (T, V), (H * V, 1), (chunk_start + 32, i_v * BV), (16, BV), (1, 0))
-        p_v3 = tl.make_block_ptr(v, (T, V), (H * V, 1), (chunk_start + 48, i_v * BV), (16, BV), (1, 0))
-        b_v0 = tl.load(p_v0, boundary_check=(0, 1)).to(tl.float32)
-        b_v1 = tl.load(p_v1, boundary_check=(0, 1)).to(tl.float32)
-        b_v2 = tl.load(p_v2, boundary_check=(0, 1)).to(tl.float32)
-        b_v3 = tl.load(p_v3, boundary_check=(0, 1)).to(tl.float32)
-
-        m0 = chunk_start + offs_m < T
-        m1 = chunk_start + 16 + offs_m < T
-        m2 = chunk_start + 32 + offs_m < T
-        m3 = chunk_start + 48 + offs_m < T
-        b0 = tl.load(beta + (chunk_start + offs_m) * H, mask=m0, other=0.0).to(tl.float32)
-        b1 = tl.load(beta + (chunk_start + 16 + offs_m) * H, mask=m1, other=0.0).to(tl.float32)
-        b2 = tl.load(beta + (chunk_start + 32 + offs_m) * H, mask=m2, other=0.0).to(tl.float32)
-        b3 = tl.load(beta + (chunk_start + 48 + offs_m) * H, mask=m3, other=0.0).to(tl.float32)
-
-        v0 = tl.dot(x00, b_v0 * b0[:, None])
-        v1 = tl.dot(x10, b_v0 * b0[:, None]) + tl.dot(x11, b_v1 * b1[:, None])
-        v2 = tl.dot(x20, b_v0 * b0[:, None]) + tl.dot(x21, b_v1 * b1[:, None]) + tl.dot(x22, b_v2 * b2[:, None])
-        v3 = (
-            tl.dot(x30, b_v0 * b0[:, None])
-            + tl.dot(x31, b_v1 * b1[:, None])
-            + tl.dot(x32, b_v2 * b2[:, None])
-            + tl.dot(x33, b_v3 * b3[:, None])
-        )
-
-        o0 = tl.zeros([16, BV], dtype=tl.float32)
-        o1 = tl.zeros([16, BV], dtype=tl.float32)
-        o2 = tl.zeros([16, BV], dtype=tl.float32)
-        o3 = tl.zeros([16, BV], dtype=tl.float32)
-
-        if i_t != 0 or USE_INITIAL_STATE:
-            qg0, kbg0 = _kda_load_qexp_kbg16(q, k, g, beta, T, H, K, chunk_start, 0, 0)
-            qg1, kbg1 = _kda_load_qexp_kbg16(q, k, g, beta, T, H, K, chunk_start, 1, 0)
-            qg2, kbg2 = _kda_load_qexp_kbg16(q, k, g, beta, T, H, K, chunk_start, 2, 0)
-            qg3, kbg3 = _kda_load_qexp_kbg16(q, k, g, beta, T, H, K, chunk_start, 3, 0)
-            if TRANSPOSE_STATE:
-                o0 += tl.dot(qg0, tl.trans(b_h1))
-                o1 += tl.dot(qg1, tl.trans(b_h1))
-                o2 += tl.dot(qg2, tl.trans(b_h1))
-                o3 += tl.dot(qg3, tl.trans(b_h1))
-                v0 -= tl.dot(tl.dot(x00, kbg0), tl.trans(b_h1))
-                v1 -= tl.dot(tl.dot(x10, kbg0) + tl.dot(x11, kbg1), tl.trans(b_h1))
-                v2 -= tl.dot(tl.dot(x20, kbg0) + tl.dot(x21, kbg1) + tl.dot(x22, kbg2), tl.trans(b_h1))
-                v3 -= tl.dot(
-                    tl.dot(x30, kbg0) + tl.dot(x31, kbg1) + tl.dot(x32, kbg2) + tl.dot(x33, kbg3),
-                    tl.trans(b_h1),
-                )
-            else:
-                o0 += tl.dot(qg0, b_h1)
-                o1 += tl.dot(qg1, b_h1)
-                o2 += tl.dot(qg2, b_h1)
-                o3 += tl.dot(qg3, b_h1)
-                v0 -= tl.dot(tl.dot(x00, kbg0), b_h1)
-                v1 -= tl.dot(tl.dot(x10, kbg0) + tl.dot(x11, kbg1), b_h1)
-                v2 -= tl.dot(tl.dot(x20, kbg0) + tl.dot(x21, kbg1) + tl.dot(x22, kbg2), b_h1)
-                v3 -= tl.dot(tl.dot(x30, kbg0) + tl.dot(x31, kbg1) + tl.dot(x32, kbg2) + tl.dot(x33, kbg3), b_h1)
-
-            if K > 64:
-                qg0, kbg0 = _kda_load_qexp_kbg16(q, k, g, beta, T, H, K, chunk_start, 0, 64)
-                qg1, kbg1 = _kda_load_qexp_kbg16(q, k, g, beta, T, H, K, chunk_start, 1, 64)
-                qg2, kbg2 = _kda_load_qexp_kbg16(q, k, g, beta, T, H, K, chunk_start, 2, 64)
-                qg3, kbg3 = _kda_load_qexp_kbg16(q, k, g, beta, T, H, K, chunk_start, 3, 64)
-                if TRANSPOSE_STATE:
-                    o0 += tl.dot(qg0, tl.trans(b_h2))
-                    o1 += tl.dot(qg1, tl.trans(b_h2))
-                    o2 += tl.dot(qg2, tl.trans(b_h2))
-                    o3 += tl.dot(qg3, tl.trans(b_h2))
-                    v0 -= tl.dot(tl.dot(x00, kbg0), tl.trans(b_h2))
-                    v1 -= tl.dot(tl.dot(x10, kbg0) + tl.dot(x11, kbg1), tl.trans(b_h2))
-                    v2 -= tl.dot(tl.dot(x20, kbg0) + tl.dot(x21, kbg1) + tl.dot(x22, kbg2), tl.trans(b_h2))
-                    v3 -= tl.dot(
-                        tl.dot(x30, kbg0) + tl.dot(x31, kbg1) + tl.dot(x32, kbg2) + tl.dot(x33, kbg3),
-                        tl.trans(b_h2),
-                    )
-                else:
-                    o0 += tl.dot(qg0, b_h2)
-                    o1 += tl.dot(qg1, b_h2)
-                    o2 += tl.dot(qg2, b_h2)
-                    o3 += tl.dot(qg3, b_h2)
-                    v0 -= tl.dot(tl.dot(x00, kbg0), b_h2)
-                    v1 -= tl.dot(tl.dot(x10, kbg0) + tl.dot(x11, kbg1), b_h2)
-                    v2 -= tl.dot(tl.dot(x20, kbg0) + tl.dot(x21, kbg1) + tl.dot(x22, kbg2), b_h2)
-                    v3 -= tl.dot(
-                        tl.dot(x30, kbg0) + tl.dot(x31, kbg1) + tl.dot(x32, kbg2) + tl.dot(x33, kbg3),
-                        b_h2,
-                    )
-
-        v0 = tl.where(m0[:, None], v0, 0.0)
-        v1 = tl.where(m1[:, None], v1, 0.0)
-        v2 = tl.where(m2[:, None], v2, 0.0)
-        v3 = tl.where(m3[:, None], v3, 0.0)
-
-        o0 = o0 * scale + tl.dot(q00, v0)
-        o1 = o1 * scale + tl.dot(q10, v0) + tl.dot(q11, v1)
-        o2 = o2 * scale + tl.dot(q20, v0) + tl.dot(q21, v1) + tl.dot(q22, v2)
-        o3 = o3 * scale + tl.dot(q30, v0) + tl.dot(q31, v1) + tl.dot(q32, v2) + tl.dot(q33, v3)
-
-        p_o0 = tl.make_block_ptr(o, (T, V), (H * V, 1), (chunk_start, i_v * BV), (16, BV), (1, 0))
-        p_o1 = tl.make_block_ptr(o, (T, V), (H * V, 1), (chunk_start + 16, i_v * BV), (16, BV), (1, 0))
-        p_o2 = tl.make_block_ptr(o, (T, V), (H * V, 1), (chunk_start + 32, i_v * BV), (16, BV), (1, 0))
-        p_o3 = tl.make_block_ptr(o, (T, V), (H * V, 1), (chunk_start + 48, i_v * BV), (16, BV), (1, 0))
-        tl.store(p_o0, o0.to(p_o0.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_o1, o1.to(p_o1.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_o2, o2.to(p_o2.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_o3, o3.to(p_o3.dtype.element_ty), boundary_check=(0, 1))
-
-        last_idx = min(chunk_start + BT, T) - 1
-
-        kg0, g_last1 = _kda_load_kg16(k, g, T, H, K, chunk_start, last_idx, 0, 0)
-        kg1, _ = _kda_load_kg16(k, g, T, H, K, chunk_start, last_idx, 1, 0)
-        kg2, _ = _kda_load_kg16(k, g, T, H, K, chunk_start, last_idx, 2, 0)
-        kg3, _ = _kda_load_kg16(k, g, T, H, K, chunk_start, last_idx, 3, 0)
-        if TRANSPOSE_STATE:
-            if i_t != 0 or USE_INITIAL_STATE:
-                b_h1 *= exp2(g_last1)[None, :]
-            b_h1 += tl.trans(tl.dot(tl.trans(kg0), v0) + tl.dot(tl.trans(kg1), v1) + tl.dot(tl.trans(kg2), v2) + tl.dot(tl.trans(kg3), v3))
-        else:
-            if i_t != 0 or USE_INITIAL_STATE:
-                b_h1 *= exp2(g_last1)[:, None]
-            b_h1 += tl.dot(tl.trans(kg0), v0) + tl.dot(tl.trans(kg1), v1) + tl.dot(tl.trans(kg2), v2) + tl.dot(tl.trans(kg3), v3)
-
-        if K > 64:
-            kg0, g_last2 = _kda_load_kg16(k, g, T, H, K, chunk_start, last_idx, 0, 64)
-            kg1, _ = _kda_load_kg16(k, g, T, H, K, chunk_start, last_idx, 1, 64)
-            kg2, _ = _kda_load_kg16(k, g, T, H, K, chunk_start, last_idx, 2, 64)
-            kg3, _ = _kda_load_kg16(k, g, T, H, K, chunk_start, last_idx, 3, 64)
-            if TRANSPOSE_STATE:
-                if i_t != 0 or USE_INITIAL_STATE:
-                    b_h2 *= exp2(g_last2)[None, :]
-                b_h2 += tl.trans(tl.dot(tl.trans(kg0), v0) + tl.dot(tl.trans(kg1), v1) + tl.dot(tl.trans(kg2), v2) + tl.dot(tl.trans(kg3), v3))
-            else:
-                if i_t != 0 or USE_INITIAL_STATE:
-                    b_h2 *= exp2(g_last2)[:, None]
-                b_h2 += tl.dot(tl.trans(kg0), v0) + tl.dot(tl.trans(kg1), v1) + tl.dot(tl.trans(kg2), v2) + tl.dot(tl.trans(kg3), v3)
-
-    if STORE_FINAL_STATE:
-        ht += i_nh * K * V
-        if TRANSPOSE_STATE:
-            p_ht1 = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-            p_ht2 = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0))
-        else:
-            p_ht1 = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-            p_ht2 = tl.make_block_ptr(ht, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
-        tl.store(p_ht1, b_h1.to(p_ht1.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_ht2, b_h2.to(p_ht2.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.heuristics({
-    "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-    "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-    "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-})
-@triton.jit(do_not_specialize=["T"])
-def chunk_kda_fwd_fully_fused_kernel(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    o,
-    h0,
-    ht,
-    cu_seqlens,
-    T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-    scale: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
-    TRANSPOSE_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
-    i_n, i_h = i_nh // H, i_nh % H
-
-    if IS_VARLEN:
-        bos = tl.load(cu_seqlens + i_n).to(tl.int64)
-        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        T = (eos - bos).to(tl.int32)
-    else:
-        bos = (i_n * T).to(tl.int64)
-        T = T.to(tl.int32)
-
-    NT = tl.cdiv(T, BT)
-
-    if TRANSPOSE_STATE:
-        b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
-        b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
-    else:
-        b_h1 = tl.zeros([64, BV], dtype=tl.float32)
-        b_h2 = tl.zeros([64, BV], dtype=tl.float32)
-
-    if USE_INITIAL_STATE:
-        h0 += i_nh * K * V
-        if TRANSPOSE_STATE:
-            p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-            p_h0_2 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0))
-        else:
-            p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-            p_h0_2 = tl.make_block_ptr(h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
-        b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
-
-    q += (bos * H + i_h) * K
-    k += (bos * H + i_h) * K
-    v += (bos * H + i_h) * V
-    g += (bos * H + i_h) * K
-    beta += bos * H + i_h
-    o += (bos * H + i_h) * V
-
-    offs_t = tl.arange(0, BT)
-    offs_b = tl.arange(0, 16)
-    offs_k = tl.arange(0, 64)
-    m_lower = offs_t[:, None] >= offs_t[None, :]
-    m_strict = offs_t[:, None] > offs_t[None, :]
-    m_eye = offs_t[:, None] == offs_t[None, :]
-
-    for i_t in range(NT):
-        chunk_start = i_t * BT
-        m_t = chunk_start + offs_t < T
-        m_pair = m_t[:, None] & m_t[None, :]
-
-        p_beta = tl.make_block_ptr(beta, (T,), (H,), (chunk_start,), (BT,), (0,))
-        b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
-        b_beta = tl.where(m_t, b_beta, 0.0)
-
-        b_Aqk = tl.zeros([BT, BT], dtype=tl.float32)
-        b_Akk = tl.zeros([BT, BT], dtype=tl.float32)
-
-        for i_c in range(0, 4):
-            row_lo = i_c * 16
-            row_hi = row_lo + 16
-            ref_t = chunk_start + min(row_lo + 8, T - chunk_start - 1)
-            m_q_rows = chunk_start + row_lo + offs_b < T
-            m_k_rows = (offs_t < row_hi) & m_t
-
-            p_q1 = tl.make_block_ptr(q, (T, K), (H * K, 1), (chunk_start + row_lo, 0), (16, 64), (1, 0))
-            p_kr1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (chunk_start + row_lo, 0), (16, 64), (1, 0))
-            p_gr1 = tl.make_block_ptr(g, (T, K), (H * K, 1), (chunk_start + row_lo, 0), (16, 64), (1, 0))
-            p_k1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (chunk_start, 0), (BT, 64), (1, 0))
-            p_g1 = tl.make_block_ptr(g, (T, K), (H * K, 1), (chunk_start, 0), (BT, 64), (1, 0))
-            b_q = tl.load(p_q1, boundary_check=(0, 1)).to(tl.float32)
-            b_kr = tl.load(p_kr1, boundary_check=(0, 1)).to(tl.float32)
-            b_gr = tl.load(p_gr1, boundary_check=(0, 1)).to(tl.float32)
-            b_k = tl.load(p_k1, boundary_check=(0, 1)).to(tl.float32)
-            b_g = tl.load(p_g1, boundary_check=(0, 1)).to(tl.float32)
-            b_g_ref = tl.load(g + ref_t * H * K + offs_k, mask=offs_k < K, other=0.0).to(tl.float32)[None, :]
-            m_q_tk = m_q_rows[:, None] & (offs_k[None, :] < K)
-            m_k_tk = m_k_rows[:, None] & (offs_k[None, :] < K)
-            b_qg = tl.where(m_q_tk, b_q * exp2(b_gr - b_g_ref), 0.0)
-            b_k_pos = tl.where(m_q_tk, b_kr * exp2(b_gr - b_g_ref), 0.0)
-            b_k_neg_t = tl.trans(tl.where(m_k_tk, b_k * exp2(b_g_ref - b_g), 0.0))
-            b_Aqk_rows = tl.dot(b_qg, b_k_neg_t)
-            b_Akk_rows = tl.dot(b_k_pos, b_k_neg_t)
-
-            if K > 64:
-                o_k = 64 + offs_k
-                p_q2 = tl.make_block_ptr(q, (T, K), (H * K, 1), (chunk_start + row_lo, 64), (16, 64), (1, 0))
-                p_kr2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (chunk_start + row_lo, 64), (16, 64), (1, 0))
-                p_gr2 = tl.make_block_ptr(g, (T, K), (H * K, 1), (chunk_start + row_lo, 64), (16, 64), (1, 0))
-                p_k2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (chunk_start, 64), (BT, 64), (1, 0))
-                p_g2 = tl.make_block_ptr(g, (T, K), (H * K, 1), (chunk_start, 64), (BT, 64), (1, 0))
-                b_q = tl.load(p_q2, boundary_check=(0, 1)).to(tl.float32)
-                b_kr = tl.load(p_kr2, boundary_check=(0, 1)).to(tl.float32)
-                b_gr = tl.load(p_gr2, boundary_check=(0, 1)).to(tl.float32)
-                b_k = tl.load(p_k2, boundary_check=(0, 1)).to(tl.float32)
-                b_g = tl.load(p_g2, boundary_check=(0, 1)).to(tl.float32)
-                b_g_ref = tl.load(g + ref_t * H * K + o_k, mask=o_k < K, other=0.0).to(tl.float32)[None, :]
-                m_q_tk = m_q_rows[:, None] & (o_k[None, :] < K)
-                m_k_tk = m_k_rows[:, None] & (o_k[None, :] < K)
-                b_qg = tl.where(m_q_tk, b_q * exp2(b_gr - b_g_ref), 0.0)
-                b_k_pos = tl.where(m_q_tk, b_kr * exp2(b_gr - b_g_ref), 0.0)
-                b_k_neg_t = tl.trans(tl.where(m_k_tk, b_k * exp2(b_g_ref - b_g), 0.0))
-                b_Aqk_rows += tl.dot(b_qg, b_k_neg_t)
-                b_Akk_rows += tl.dot(b_k_pos, b_k_neg_t)
-
-            for i_r in range(0, 16):
-                b_aqk_row = tl.sum(tl.where(offs_b[:, None] == i_r, b_Aqk_rows, 0.0), axis=0)
-                b_akk_row = tl.sum(tl.where(offs_b[:, None] == i_r, b_Akk_rows, 0.0), axis=0)
-                b_Aqk += tl.where(offs_t[:, None] == row_lo + i_r, b_aqk_row[None, :], 0.0)
-                b_Akk += tl.where(offs_t[:, None] == row_lo + i_r, b_akk_row[None, :], 0.0)
-
-        b_Aqk = tl.where(m_lower & m_pair, b_Aqk * scale, 0.0)
-        b_Akk = tl.where(m_strict & m_pair, b_Akk * b_beta[:, None], 0.0)
-
-        b_Ai = -b_Akk
-        for i in range(2, min(BT, T - chunk_start)):
-            b_a = tl.sum(tl.where(offs_t[:, None] == i, -b_Akk, 0.0), axis=0)
-            b_a = tl.where(offs_t < i, b_a, 0.0)
-            b_a += tl.sum(b_a[:, None] * b_Ai, axis=0)
-            b_Ai = tl.where((offs_t == i)[:, None], b_a, b_Ai)
-        b_Ai += m_eye
-        b_Ai = tl.where(m_pair, b_Ai, 0.0)
-
-        p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (chunk_start, i_v * BV), (BT, BV), (1, 0))
-        b_v = tl.load(p_v, boundary_check=(0, 1)).to(tl.float32)
-        b_vnew = tl.dot(b_Ai, (b_v * b_beta[:, None]).to(b_Ai.dtype))
-        b_vnew = tl.where(m_t[:, None], b_vnew, 0.0)
-
-        b_o = tl.zeros([BT, BV], dtype=tl.float32)
-
-        p_q1 = tl.make_block_ptr(q, (T, K), (H * K, 1), (chunk_start, 0), (BT, 64), (1, 0))
-        p_k1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (chunk_start, 0), (BT, 64), (1, 0))
-        p_g1 = tl.make_block_ptr(g, (T, K), (H * K, 1), (chunk_start, 0), (BT, 64), (1, 0))
-        b_q = tl.load(p_q1, boundary_check=(0, 1)).to(tl.float32)
-        b_k = tl.load(p_k1, boundary_check=(0, 1)).to(tl.float32)
-        b_g = tl.load(p_g1, boundary_check=(0, 1)).to(tl.float32)
-        m_tk = m_t[:, None] & (offs_k[None, :] < K)
-        b_qg = tl.where(m_tk, b_q * exp2(b_g), 0.0)
-        b_kbg = tl.where(m_tk, b_k * b_beta[:, None] * exp2(b_g), 0.0)
-        if TRANSPOSE_STATE:
-            b_o += tl.dot(b_qg, tl.trans(b_h1))
-            b_w = tl.dot(b_Ai, b_kbg)
-            b_vnew -= tl.dot(b_w, tl.trans(b_h1))
-        else:
-            b_o += tl.dot(b_qg, b_h1)
-            b_w = tl.dot(b_Ai, b_kbg)
-            b_vnew -= tl.dot(b_w, b_h1)
-
-        if K > 64:
-            o_k = 64 + offs_k
-            p_q2 = tl.make_block_ptr(q, (T, K), (H * K, 1), (chunk_start, 64), (BT, 64), (1, 0))
-            p_k2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (chunk_start, 64), (BT, 64), (1, 0))
-            p_g2 = tl.make_block_ptr(g, (T, K), (H * K, 1), (chunk_start, 64), (BT, 64), (1, 0))
-            b_q = tl.load(p_q2, boundary_check=(0, 1)).to(tl.float32)
-            b_k = tl.load(p_k2, boundary_check=(0, 1)).to(tl.float32)
-            b_g = tl.load(p_g2, boundary_check=(0, 1)).to(tl.float32)
-            m_tk = m_t[:, None] & (o_k[None, :] < K)
-            b_qg = tl.where(m_tk, b_q * exp2(b_g), 0.0)
-            b_kbg = tl.where(m_tk, b_k * b_beta[:, None] * exp2(b_g), 0.0)
-            if TRANSPOSE_STATE:
-                b_o += tl.dot(b_qg, tl.trans(b_h2))
-                b_w = tl.dot(b_Ai, b_kbg)
-                b_vnew -= tl.dot(b_w, tl.trans(b_h2))
-            else:
-                b_o += tl.dot(b_qg, b_h2)
-                b_w = tl.dot(b_Ai, b_kbg)
-                b_vnew -= tl.dot(b_w, b_h2)
-
-        b_vnew = tl.where(m_t[:, None], b_vnew, 0.0)
-        b_o = b_o * scale + tl.dot(b_Aqk, b_vnew)
-
-        p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (chunk_start, i_v * BV), (BT, BV), (1, 0))
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
-
-        last_idx = min(chunk_start + BT, T) - 1
-
-        p_k1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (chunk_start, 0), (BT, 64), (1, 0))
-        p_g1 = tl.make_block_ptr(g, (T, K), (H * K, 1), (chunk_start, 0), (BT, 64), (1, 0))
-        b_k = tl.load(p_k1, boundary_check=(0, 1)).to(tl.float32)
-        b_g = tl.load(p_g1, boundary_check=(0, 1)).to(tl.float32)
-        b_g_last = tl.load(g + last_idx * H * K + offs_k, mask=offs_k < K, other=0.0).to(tl.float32)
-        if TRANSPOSE_STATE:
-            b_h1 *= exp2(b_g_last)[None, :]
-        else:
-            b_h1 *= exp2(b_g_last)[:, None]
-        m_tk = m_t[:, None] & (offs_k[None, :] < K)
-        b_kg = tl.where(m_tk, b_k * exp2(b_g_last[None, :] - b_g), 0.0)
-        b_dh = tl.dot(tl.trans(b_kg), b_vnew)
-        if TRANSPOSE_STATE:
-            b_h1 += tl.trans(b_dh)
-        else:
-            b_h1 += b_dh
-
-        if K > 64:
-            o_k = 64 + offs_k
-            p_k2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (chunk_start, 64), (BT, 64), (1, 0))
-            p_g2 = tl.make_block_ptr(g, (T, K), (H * K, 1), (chunk_start, 64), (BT, 64), (1, 0))
-            b_k = tl.load(p_k2, boundary_check=(0, 1)).to(tl.float32)
-            b_g = tl.load(p_g2, boundary_check=(0, 1)).to(tl.float32)
-            b_g_last = tl.load(g + last_idx * H * K + o_k, mask=o_k < K, other=0.0).to(tl.float32)
-            if TRANSPOSE_STATE:
-                b_h2 *= exp2(b_g_last)[None, :]
-            else:
-                b_h2 *= exp2(b_g_last)[:, None]
-            m_tk = m_t[:, None] & (o_k[None, :] < K)
-            b_kg = tl.where(m_tk, b_k * exp2(b_g_last[None, :] - b_g), 0.0)
-            b_dh = tl.dot(tl.trans(b_kg), b_vnew)
-            if TRANSPOSE_STATE:
-                b_h2 += tl.trans(b_dh)
-            else:
-                b_h2 += b_dh
-
-    if STORE_FINAL_STATE:
-        ht += i_nh * K * V
-        if TRANSPOSE_STATE:
-            p_ht1 = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-            p_ht2 = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0))
-        else:
-            p_ht1 = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-            p_ht2 = tl.make_block_ptr(ht, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0))
-        tl.store(p_ht1, b_h1.to(p_ht1.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_ht2, b_h2.to(p_ht2.dtype.element_ty), boundary_check=(0, 1))
-
-
-def _chunk_kda_fwd_fully_fused(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
-    chunk_size: int = 64,
-    transpose_state_layout: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    B, T, H, K, V = *q.shape, v.shape[-1]
-    N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    o = torch.empty_like(v)
-    if output_final_state:
-        if transpose_state_layout:
-            final_state = q.new_empty(N, H, V, K, dtype=torch.float32)
-        else:
-            final_state = q.new_empty(N, H, K, V, dtype=torch.float32)
-    else:
-        final_state = None
-
-    # A single 128-wide V tile mirrors the cuLA/CUTLASS tile shape, but the
-    # Triton version keeps the state, inverse blocks, corrected V, and output
-    # fragments live in one program.  Splitting V into two 64-wide programs
-    # gives better occupancy and avoids the performance cliff from register
-    # pressure on H100.
-    BV = 64
-    grid = (triton.cdiv(V, BV), N * H)
-    chunk_kda_fwd_fully_fused_block_kernel[grid](
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        o=o,
-        h0=initial_state,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
-        T=T,
-        H=H,
-        K=K,
-        V=V,
-        BT=chunk_size,
-        BV=BV,
-        scale=scale,
-        TRANSPOSE_STATE=transpose_state_layout,
-        num_warps=4,
-        num_stages=1,
-    )
-    return o, final_state
-
-
 @torch.compiler.disable
 @input_guard
 def chunk_kda_fwd_fused(
@@ -1088,6 +1070,7 @@ def chunk_kda_fwd_fused(
     assert q.shape[-1] <= 256, "Currently this fused KDA path supports key headdim <= 256."
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    intra_fusion_mode = kwargs.pop("intra_fusion_mode", None) or os.getenv("FLA_KDA_FUSED_INTRA_MODE", "full")
 
     if use_qk_l2norm_in_kernel:
         q, _ = l2norm_fwd(q)
@@ -1116,37 +1099,60 @@ def chunk_kda_fwd_fused(
             chunk_indices=chunk_indices,
         )
 
-    fully_fused_supported = q.shape[-1] == 128 and v.shape[-1] == 128 and chunk_size == 64
-    if fully_fused_supported:
-        # Experimental path for the cuLA benchmark tile.  It carries the full
-        # 128x128 state in one Triton program and fuses intra, WY, H, and O.
-        return _chunk_kda_fwd_fully_fused(
+    if safe_gate or chunk_size != 64 or intra_fusion_mode == "none":
+        w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
             q=q,
             k=k,
             v=v,
-            g=g,
+            gk=g,
             beta=beta,
             scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             chunk_size=chunk_size,
-            transpose_state_layout=transpose_state_layout,
+            chunk_indices=chunk_indices,
+            safe_gate=safe_gate,
+            disable_recompute=False,
         )
-
-    w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
-        q=q,
-        k=k,
-        v=v,
-        gk=g,
-        beta=beta,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-        chunk_indices=chunk_indices,
-        safe_gate=safe_gate,
-        disable_recompute=False,
-    )
+    elif intra_fusion_mode == "full":
+        w, u, _, kg, Aqk, _ = _chunk_kda_fwd_intra_fused(
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
+    elif intra_fusion_mode == "diag_inter":
+        w, u, _, kg, Aqk, _ = _chunk_kda_fwd_intra_diag_inter_fused(
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
+    elif intra_fusion_mode == "inter_recompute":
+        w, u, _, kg, Aqk, _ = _chunk_kda_fwd_intra_inter_recompute_fused(
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
+    else:
+        raise ValueError(
+            "FLA_KDA_FUSED_INTRA_MODE must be one of: full, diag_inter, inter_recompute, none."
+        )
 
     return _chunk_kda_fwd_h_o_fused(
         q=q,
